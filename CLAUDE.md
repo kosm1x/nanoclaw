@@ -18,13 +18,18 @@ Single Node.js process that connects to WhatsApp, routes messages to Claude Agen
 | `src/channels/whatsapp.ts` | WhatsApp connection, auth, send/receive |
 | `src/ipc.ts` | IPC watcher and task processing |
 | `src/router.ts` | Message formatting and outbound routing |
-| `src/config.ts` | Trigger pattern, paths, intervals |
+| `src/config.ts` | Trigger pattern, paths, intervals, env var defaults |
+| `src/env.ts` | Custom .env parser — secrets stay off `process.env` |
 | `src/container-runner.ts` | Spawns agent containers with mounts |
+| `src/container-runtime.ts` | Docker abstraction (swap runtime here) |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
 | `src/group-queue.ts` | Per-group concurrency queue with global container limit |
+| `src/group-folder.ts` | Path validation and group folder security |
+| `src/mount-security.ts` | Mount allowlist validation |
 | `src/types.ts` | Channel interface and shared types |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
+| `container/agent-runner/src/index.ts` | Container-side agent runner (reads stdin, writes stdout) |
 | `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
 
 ## Skills
@@ -50,6 +55,7 @@ npm run typecheck    # Type check without emitting
 npm run format       # Format with prettier
 npm run test         # Run tests once (vitest)
 npm run test:watch   # Run tests in watch mode
+npm run test -- src/db.test.ts   # Run a single test file
 npm run auth         # WhatsApp authentication setup
 ./container/build.sh # Rebuild agent container image
 ```
@@ -67,6 +73,22 @@ systemctl --user stop nanoclaw
 systemctl --user restart nanoclaw
 ```
 
+## Environment Variables
+
+All variables have sensible defaults; `.env` is optional. Secrets are never loaded into `process.env` — they're parsed from disk via `src/env.ts` and passed to containers via stdin only.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ASSISTANT_NAME` | `Andy` | Trigger word for non-main groups |
+| `ASSISTANT_HAS_OWN_NUMBER` | `false` | Whether assistant has its own WhatsApp number |
+| `CONTAINER_IMAGE` | `nanoclaw-agent:latest` | Container image to use |
+| `MAX_CONCURRENT_CONTAINERS` | `5` | Global concurrent container limit |
+| `CONTAINER_TIMEOUT` | `1800000` | Max execution time per invocation (ms) |
+| `IDLE_TIMEOUT` | `1800000` | Keep-alive after last result (ms) |
+| `CONTAINER_MAX_OUTPUT_SIZE` | `10485760` | Max container stdout size (bytes) |
+| `LOG_LEVEL` | `info` | Pino log level |
+| `TZ` | system | Timezone for cron tasks |
+
 ## Architecture: Message Flow
 
 ```
@@ -81,7 +103,7 @@ WhatsApp (Baileys) → SQLite (messages table)
                     [per-group mounts, isolated session]
                               ↓
                     Claude Agent SDK (container/agent-runner/)
-                    [reads IPC input, writes IPC output]
+                    [reads JSON stdin, writes JSON stdout]
                               ↓
                     IPC watcher (src/ipc.ts)
                               ↓
@@ -89,6 +111,19 @@ WhatsApp (Baileys) → SQLite (messages table)
 ```
 
 The orchestrator tracks two cursors per group: `lastTimestamp` (messages seen) and `lastAgentTimestamp` (messages processed by agent). On restart, unprocessed messages are recovered automatically.
+
+## Container I/O Protocol
+
+**Stdin** (JSON): `{ prompt, sessionId, groupFolder, chatJid, isMain, secrets }`
+
+**Stdout**: JSON wrapped in sentinel markers (one object per output):
+```
+---NANOCLAW_OUTPUT_START---
+{"status":"success","result":"...","newSessionId":"..."}
+---NANOCLAW_OUTPUT_END---
+```
+
+**IPC follow-up messages**: Written as files to `/workspace/ipc/input/` inside the container while the agent is running. The host IPC watcher (`src/ipc.ts`) handles outbound messages written by the agent.
 
 ## Key Patterns
 
@@ -104,6 +139,26 @@ The orchestrator tracks two cursors per group: `lastTimestamp` (messages seen) a
 
 **Task snapshots**: Before each agent run, the current task list (filtered to the group's scope) is written into the container mount so the agent can query and schedule tasks.
 
+**Secrets pattern**: Never pass secrets via `process.env` (leaks to child processes). Use `readEnvFile()` from `src/env.ts` to read from disk, then pass to containers via stdin JSON only.
+
+**Group folder validation**: Folder names must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`. The name `global` is reserved. `isValidGroupFolder()` / `assertValidGroupFolder()` in `src/group-folder.ts` enforce this.
+
+**Swapping container runtime**: All Docker calls are isolated to `src/container-runtime.ts`. Change that single file (or set `CONTAINER_RUNTIME` env) to swap Docker for Podman or another OCI runtime.
+
+## Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `chats` | Chat metadata (JID, name, channel, is_group) |
+| `messages` | Message log with sender, content, timestamp |
+| `scheduled_tasks` | Cron/interval/once tasks with schedule and context_mode |
+| `task_run_logs` | Execution history with duration and error info |
+| `router_state` | Per-group cursor state (last_timestamp, last_agent_timestamp) |
+| `sessions` | Claude Agent SDK session IDs per group folder |
+| `registered_groups` | Group config: JID → name, folder, trigger_pattern, containerConfig |
+
+Tests use `_initTestDatabase()` (from `src/db.ts`) in `beforeEach` for a fresh in-memory SQLite instance per test.
+
 ## Security Model
 
 - **Container isolation**: Agents run in containers (Apple Container on macOS, Docker elsewhere) — no host filesystem access
@@ -111,6 +166,7 @@ The orchestrator tracks two cursors per group: `lastTimestamp` (messages seen) a
 - **Mount allowlist**: External file at `~/.config/nanoclaw/mount-allowlist.json` controls what extra paths can be mounted (not accessible from inside container)
 - **Authorization**: Main group has admin powers (register groups, manage all tasks). Other groups are restricted to their own scope
 - **Secrets**: Never written to disk — passed via stdin only
+- **Path traversal defense**: `ensureWithinBase()` in `src/group-folder.ts` prevents escaping base directories; applied to both group folders and IPC paths
 
 ## Container Build Cache
 
